@@ -7,10 +7,12 @@ import argparse
 import re
 import csv
 import json
+import os  # [NEW]
 from dataclasses import dataclass
-from typing import List, Tuple, Sequence, Optional
+from typing import List, Tuple, Sequence, Optional, Dict, Any  # [CHANGED]
 import numpy as np
 import math
+from pathlib import Path  # [NEW]
 
 # ------------------------------ Operators ------------------------------
 
@@ -137,6 +139,144 @@ def prefix_to_infix(prefix_tokens: Sequence[str], int_base: int = 10, balanced: 
     out, rem = parse(list(prefix_tokens))
     if rem: raise ValueError(f"Unparsed tail in prefix: {rem}")
     return f"({out})"
+
+# ------------------------------ Tree construction [NEW] ------------------------------
+
+@dataclass
+class TreeNode:
+    """A generic node in the generated expression tree."""
+    token: str
+    children: List["TreeNode"]
+
+    # Fields used for integer leaves (when token starts with 'INT')
+    is_int: bool = False
+    int_tag: Optional[str] = None
+    digits: Optional[List[int]] = None
+    int_base: Optional[int] = None
+    balanced: Optional[bool] = None
+    int_value: Optional[int] = None
+
+    def to_json(self) -> Dict[str, Any]:
+        if self.is_int:
+            return {
+                "type": "int",
+                "tag": self.int_tag,
+                "digits": self.digits,
+                "base": self.int_base,
+                "balanced": self.balanced,
+                "value": self.int_value,
+            }
+        return {
+            "type": "op",
+            "token": self.token,
+            "arity": len(self.children),
+            "children": [c.to_json() for c in self.children],
+        }
+
+def prefix_to_tree(prefix_tokens: Sequence[str], int_base: int = 10, balanced: bool = False) -> TreeNode:
+    """Turn the exact prefix tokens into a concrete tree structure (operators + INT leaves)."""
+    toks = list(prefix_tokens)  # copy
+    i = 0
+
+    def is_digit_tok(t: str) -> bool:
+        return re.fullmatch(r"-?\d+", t) is not None
+
+    def parse_int_from(i0: int) -> Tuple[TreeNode, int]:
+        if i0 >= len(toks):
+            raise ValueError("Unexpected end while parsing INT")
+        tag = toks[i0]
+        if not tag.startswith("INT"):
+            raise ValueError("parse_int_from called on non-INT token")
+        i1 = i0 + 1
+        digits: List[int] = []
+        while i1 < len(toks) and is_digit_tok(toks[i1]):
+            digits.append(int(toks[i1]))
+            i1 += 1
+        # compute value in the same way as prefix_to_infix
+        if not digits:
+            val = 0
+        elif balanced:
+            b = int_base; val = 0
+            for d in digits:
+                val = val * b + d
+        else:
+            if int_base > 0:
+                b = int_base; val = 0
+                for d in digits:
+                    val = val * b + d
+                if tag == "INT-":
+                    val = -val
+            else:
+                b = int_base; val = 0
+                for d in digits:
+                    val = val * b + d
+        node = TreeNode(
+            token=tag, children=[],
+            is_int=True, int_tag=tag, digits=digits,
+            int_base=int_base, balanced=balanced, int_value=val
+        )
+        return node, i1
+
+    def parse_from(i0: int) -> Tuple[TreeNode, int]:
+        if i0 >= len(toks):
+            raise ValueError("Empty prefix")
+        t = toks[i0]
+        if t in OPERATORS:
+            n = OPERATORS[t]
+            children: List[TreeNode] = []
+            j = i0 + 1
+            for _ in range(n):
+                child, j = parse_from(j)
+                children.append(child)
+            return TreeNode(token=t, children=children), j
+        elif t.startswith("INT"):
+            return parse_int_from(i0)
+        else:
+            # Fallback: treat as symbol leaf (shouldn't appear in this generator)
+            return TreeNode(token=t, children=[]), i0 + 1
+
+    root, j = parse_from(0)
+    if j != len(toks):
+        raise ValueError(f"Unparsed tail in prefix: {toks[j:]}")
+    return root
+
+def tree_to_dot(root: TreeNode) -> str:
+    """Convert a TreeNode into a Graphviz DOT graph as a string."""
+    lines = ["digraph expr {", "  node [shape=box];"]
+    counter = [0]
+    def new_id() -> str:
+        counter[0] += 1
+        return f"n{counter[0]}"
+
+    def escape(s: str) -> str:
+        return s.replace('"', '\\"')
+
+    def label_for(node: TreeNode) -> str:
+        if node.is_int:
+            tag = node.int_tag or "INT"
+            val = node.int_value if node.int_value is not None else "?"
+            return f"{tag}\\n{val}"
+        else:
+            return node.token
+
+    def walk(node: TreeNode) -> Tuple[str, List[str]]:
+        me = new_id()
+        lbl = label_for(node)
+        decl = f'  {me} [label="{escape(lbl)}"];'
+        edges: List[str] = []
+        child_ids: List[str] = []
+        for ch in node.children:
+            cid, sublines = walk(ch)
+            edges.extend(sublines)
+            child_ids.append(cid)
+        for cid in child_ids:
+            edges.append(f"  {me} -> {cid};")
+        return me, [decl] + edges
+
+    _, all_lines = walk(root)
+    lines.extend(all_lines)
+    lines.append("}")
+    return "\n".join(lines)
 
 # ------------------------------ Safe numeric evaluator ------------------------------
 
@@ -383,6 +523,15 @@ def main():
 
     p.add_argument("--out_csv", type=str, default="expressions.csv", help="CSV output path")
     p.add_argument("--quiet", action="store_true", help="Do not print expressions to stdout")
+
+    # ------------------------------ New outputs ------------------------------
+    p.add_argument("--out_trees", type=str, default=None,
+                   help="JSONL output for trees (default: <out_csv>.trees.jsonl)")  # [NEW]
+    p.add_argument("--dot_dir", type=str, default=None,
+                   help="If set, write a Graphviz .dot file per expression to this directory")  # [NEW]
+    p.add_argument("--with_ids", action="store_true",
+                   help="If set, prepend an idx column to the CSV (1-based)")  # [NEW]
+
     args = p.parse_args()
 
     cfg = GenConfig(
@@ -398,9 +547,19 @@ def main():
     gen = ExprGen(cfg)
     rng = np.random.default_rng(args.seed)
 
+    out_csv_path = Path(args.out_csv)
+    if args.out_trees is None:
+        out_trees_path = out_csv_path.with_suffix(out_csv_path.suffix + ".trees.jsonl")
+    else:
+        out_trees_path = Path(args.out_trees)
+
+    if args.dot_dir is not None:
+        Path(args.dot_dir).mkdir(parents=True, exist_ok=True)
+
     written = 0
-    with open(args.out_csv, "w", newline="") as f:
-        w = csv.writer(f)
+    # [CHANGED] open both CSV and JSONL
+    with open(out_csv_path, "w", newline="") as f_csv, open(out_trees_path, "w", encoding="utf-8") as f_jsonl:
+        w_csv = csv.writer(f_csv)
         while written < args.num:
             if args.ops is not None:
                 nb_ops = int(args.ops)
@@ -409,17 +568,55 @@ def main():
             else:
                 nb_ops = int(args.max_ops)
 
-            infix = gen.generate_infix(nb_total_ops=nb_ops)
+            # [CHANGED] Generate prefix first so we can build the tree
+            prefix = gen.generate_prefix(nb_total_ops=nb_ops)
+            infix = prefix_to_infix(prefix, int_base=cfg.int_base, balanced=cfg.balanced)
             val = evaluate_infix(infix)
 
             # Resample on NaN OR infinite:
             if not math.isfinite(val):
                 continue
 
-            if not args.quiet:
-                print(f"{infix},{val}")
+            idx = written + 1  # 1-based for readability / CSV line-number alignment
 
-            w.writerow([infix, f"{val:.12g}"])
+            if not args.quiet:
+                if args.with_ids:
+                    print(f"{idx},{infix},{val}")
+                else:
+                    print(f"{infix},{val}")
+
+            # CSV row (optionally with idx first)
+            if args.with_ids:
+                w_csv.writerow([idx, infix, f"{val:.12g}"])
+            else:
+                w_csv.writerow([infix, f"{val:.12g}"])
+
+            # Build and write tree JSON line
+            tree = prefix_to_tree(prefix, int_base=cfg.int_base, balanced=cfg.balanced)
+            rec = {
+                "idx": idx,
+                "ops": nb_ops,
+                "infix": infix,
+                "result": float(f"{val:.12g}"),
+                "prefix": prefix,
+                "tree": tree.to_json(),
+                "config": {
+                    "int_base": cfg.int_base,
+                    "balanced": cfg.balanced,
+                    "positive": cfg.positive,
+                    "max_int": cfg.max_int,
+                    "mode": cfg.mode,
+                }
+            }
+            f_jsonl.write(json.dumps(rec, separators=(",", ":"), ensure_ascii=False) + "\n")
+
+            # Optional DOT file
+            if args.dot_dir is not None:
+                dot_text = tree_to_dot(tree)
+                dot_path = Path(args.dot_dir) / f"expr_{idx:06d}.dot"
+                with open(dot_path, "w", encoding="utf-8") as f_dot:
+                    f_dot.write(dot_text)
+
             written += 1
 
 if __name__ == "__main__":
