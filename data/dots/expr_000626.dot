@@ -1,0 +1,36 @@
+digraph expr {
+  node [shape=box];
+  n1 [label="div"];
+  n2 [label="INT+\n4"];
+  n3 [label="add"];
+  n4 [label="add"];
+  n5 [label="div"];
+  n6 [label="INT+\n1"];
+  n7 [label="div"];
+  n8 [label="INT+\n2"];
+  n9 [label="INT+\n5"];
+  n7 -> n8;
+  n7 -> n9;
+  n5 -> n6;
+  n5 -> n7;
+  n10 [label="INT+\n2"];
+  n4 -> n5;
+  n4 -> n10;
+  n11 [label="sub"];
+  n12 [label="sub"];
+  n13 [label="INT+\n1"];
+  n14 [label="INT+\n4"];
+  n12 -> n13;
+  n12 -> n14;
+  n15 [label="add"];
+  n16 [label="INT+\n1"];
+  n17 [label="INT+\n5"];
+  n15 -> n16;
+  n15 -> n17;
+  n11 -> n12;
+  n11 -> n15;
+  n3 -> n4;
+  n3 -> n11;
+  n1 -> n2;
+  n1 -> n3;
+}
